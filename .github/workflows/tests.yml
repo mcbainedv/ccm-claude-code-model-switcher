@@ -1,12 +1,3 @@
-# GitHub Actions workflow for ccm.
-# The gh OAuth token used to publish this repository lacks the `workflow`
-# scope, which GitHub requires to push files under .github/workflows/.
-# To enable CI on your fork/repository:
-#   gh auth refresh -s workflow
-#   mkdir -p .github/workflows
-#   git mv docs/ci-tests.yml .github/workflows/tests.yml
-#   git commit -m "ci: run tests" && git push
-
 name: tests
 
 on:

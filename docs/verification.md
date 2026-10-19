@@ -20,8 +20,9 @@ real user config is never touched. It covers:
 * **automatic vision routing** (`VISION_DISABLE` / `VISION_MODEL` per preset),
 * `ccm vision`, `ccm doctor`, error handling and secret hygiene.
 
-Current status: **40/40 tests pass** on Python 3.14. A ready-to-enable GitHub
-Actions workflow (Python 3.12 + fish) is included at `docs/ci-tests.yml`.
+Current status: **40/40 tests pass** on Python 3.14. CI
+(`.github/workflows/tests.yml`) runs the suite on Python 3.12 with fish installed
+on every push and pull request.
 
 ## 2. Independent adversarial verification
 

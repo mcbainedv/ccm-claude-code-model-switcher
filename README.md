@@ -1,5 +1,7 @@
 # ccm — Claude Code model switcher for OpenRouter
 
+[![tests](https://github.com/mcbainedv/ccm-claude-code-model-switcher/actions/workflows/tests.yml/badge.svg)](https://github.com/mcbainedv/ccm-claude-code-model-switcher/actions/workflows/tests.yml)
+
 `ccm` switches which model the **Claude Code CLI** uses when it is pointed at
 **OpenRouter** (for example a DeepSeek-only setup). One short terminal command
 changes the default, and named presets make the usual choices instant.
@@ -309,8 +311,8 @@ docs/verification.md    independent verification summary
 INSTALL.md              step-by-step install/setup guide
 ```
 
-A ready-to-enable GitHub Actions workflow is included at
-`docs/ci-tests.yml` (GitHub requires the `workflow` token scope to push it).
+CI runs the test suite on every push and pull request
+(`.github/workflows/tests.yml`).
 
 ---
 
