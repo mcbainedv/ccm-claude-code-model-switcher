@@ -1,0 +1,2325 @@
+#!/usr/bin/env python3
+# ccm-claude-model-switcher
+"""ccm — Claude Code model switcher for OpenRouter.
+
+Switch which model the Claude Code CLI uses (through OpenRouter) with one
+terminal command, keep named presets, search the live OpenRouter catalog, and
+launch Claude Code directly on a chosen model.
+
+ccm only manages *model-selection* environment variables. It never reads,
+writes or moves your OpenRouter API key: ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY
+stay exactly where you configured them (usually ~/.config/fish/config.fish).
+
+Managed files:
+  ~/.config/ccm/config.json          presets + active selection
+  ~/.config/ccm/env.fish             exported env vars for fish
+  ~/.config/ccm/env.sh               exported env vars for POSIX shells
+  ~/.config/ccm/models-cache.json    cached OpenRouter model catalog
+  ~/.config/fish/functions/ccm.fish  fish wrapper that re-sources env.fish
+  ~/.config/fish/completions/ccm.fish fish completions
+  ~/.config/fish/config.fish         one managed "source env.fish" block
+  ~/.claude/settings.json            optional modelPicker rows (ccm picker on)
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import difflib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None
+
+VERSION = "1.1.0"
+MARKER = "ccm-claude-model-switcher"
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api"
+OPENROUTER_MODELS_URL = OPENROUTER_BASE_URL + "/v1/models"
+
+FISH_BLOCK_BEGIN = "# >>> ccm managed block >>>"
+FISH_BLOCK_END = "# <<< ccm managed block <<<"
+
+COMMANDS = [
+    "list", "current", "use", "pick", "run", "search", "add", "remove",
+    "refresh", "env", "install", "uninstall", "picker", "vision", "doctor",
+    "completions", "version", "help", "__presets",
+]
+
+# Model-selection variables ccm owns. Everything else in the environment
+# (base URL, API key/token, betas, ...) is left untouched.
+CORE_ENV_VARS = {
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+}
+
+MANAGED_ENV_VARS = [
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION",
+    # Automatic vision routing (DeepSeek text-only models + Gemini image hook).
+    "VISION_MODEL",
+    "VISION_DISABLE",
+]
+
+DEFAULT_SETTINGS = {
+    "auto_append_1m": True,
+    "models_url": OPENROUTER_MODELS_URL,
+    "default_small_model": "deepseek/deepseek-v4-flash-0731[1m]",
+    "default_subagent_model": "deepseek/deepseek-v4-flash-0731[1m]",
+    "cache_ttl_hours": 24,
+    "claude_bin": "claude",
+    "vision_auto": True,
+    "vision_model": "",
+}
+
+SMALL_MODEL_HINTS = ("flash", "haiku", "mini", "small", "lite", "nano", "fast", "air")
+FALLBACK_PRESETS = [
+    {
+        "name": "pro",
+        "label": "DeepSeek V4 Pro",
+        "primary": "deepseek/deepseek-v4-pro-0813[1m]",
+        "small": "deepseek/deepseek-v4-flash-0731[1m]",
+        "subagent": "deepseek/deepseek-v4-flash-0731[1m]",
+        "description": "Main workhorse model",
+    },
+    {
+        "name": "flash",
+        "label": "DeepSeek V4 Flash",
+        "primary": "deepseek/deepseek-v4-flash-0731[1m]",
+        "small": "deepseek/deepseek-v4-flash-0731[1m]",
+        "subagent": "deepseek/deepseek-v4-flash-0731[1m]",
+        "description": "Cheap, fast model",
+    },
+]
+
+
+class CcmError(Exception):
+    """A user-facing error; printed without a traceback."""
+
+
+MODEL_ID_RE = re.compile(
+    r"^~?[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._:-]*)+(?:\[[12]m\])?$"
+)
+
+
+def looks_like_model_id(value: str) -> bool:
+    """True only for provider/model[:variant][[1m]] shapes (never prose/paths)."""
+    return bool(MODEL_ID_RE.match((value or "").strip()))
+
+
+def sanitize_text(value: object) -> str:
+    """Collapse control/newline characters so labels cannot inject shell lines."""
+    text = str(value or "")
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# ---------------------------------------------------------------------------
+# small terminal helpers
+# ---------------------------------------------------------------------------
+
+def _use_color() -> bool:
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _paint(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _use_color() else text
+
+
+def ok(msg: str) -> None:
+    print(f"{_paint('32', '✔')} {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"{_paint('33', '!')} {msg}")
+
+
+def fail(msg: str) -> None:
+    print(f"{_paint('31', '✖')} {msg}")
+
+
+def info(msg: str) -> None:
+    print(msg)
+
+
+# ---------------------------------------------------------------------------
+# paths
+# ---------------------------------------------------------------------------
+
+def home_dir() -> Path:
+    home = os.environ.get("HOME")
+    return Path(home).expanduser() if home else Path.home()
+
+
+def _xdg_config_home() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    return Path(xdg).expanduser() if xdg else home_dir() / ".config"
+
+
+def config_dir() -> Path:
+    override = os.environ.get("CCM_CONFIG_DIR")
+    return Path(override).expanduser() if override else _xdg_config_home() / "ccm"
+
+
+def fish_dir() -> Path:
+    return _xdg_config_home() / "fish"
+
+
+def claude_dir() -> Path:
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(override).expanduser() if override else home_dir() / ".claude"
+
+
+def config_path() -> Path:
+    return config_dir() / "config.json"
+
+
+def cache_path() -> Path:
+    return config_dir() / "models-cache.json"
+
+
+def env_fish_path() -> Path:
+    return config_dir() / "env.fish"
+
+
+def env_sh_path() -> Path:
+    return config_dir() / "env.sh"
+
+
+def fish_function_path() -> Path:
+    return fish_dir() / "functions" / "ccm.fish"
+
+
+def fish_completions_path() -> Path:
+    return fish_dir() / "completions" / "ccm.fish"
+
+
+def fish_config_path() -> Path:
+    return fish_dir() / "config.fish"
+
+
+def claude_settings_path() -> Path:
+    return claude_dir() / "settings.json"
+
+
+def installed_binary_path() -> Path:
+    return home_dir() / ".local" / "bin" / "ccm"
+
+
+@contextlib.contextmanager
+def config_lock():
+    """Serialise config read-modify-write so concurrent ccm runs cannot lose presets."""
+    handle = None
+    try:
+        config_dir().mkdir(parents=True, exist_ok=True)
+        handle = open(config_dir() / ".lock", "a+", encoding="utf-8")
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except OSError:
+        handle = None  # read-only config dir: proceed without a lock
+    try:
+        yield
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# filesystem helpers
+# ---------------------------------------------------------------------------
+
+def atomic_write(path: Path, text: str, mode: int | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        if mode is None:
+            mode = (path.stat().st_mode & 0o777) if path.exists() else 0o644
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def backup_once(path: Path) -> Path | None:
+    """Copy path to <name>.ccm-backup the first time, never overwrite it."""
+    if not path.exists():
+        return None
+    backup = path.with_name(path.name + ".ccm-backup")
+    if backup.exists():
+        return backup
+    shutil.copy2(path, backup)
+    return backup
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise CcmError(f"cannot read {path}: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+
+def strip_context_suffix(model: str) -> str:
+    return re.sub(r"\[[12]m\]$", "", (model or "").strip())
+
+
+def has_context_suffix(model: str) -> bool:
+    return bool(re.search(r"\[[12]m\]$", (model or "").strip()))
+
+
+def _pretty_provider(provider: str) -> str:
+    known = {
+        "deepseek": "DeepSeek", "openai": "OpenAI", "anthropic": "Anthropic",
+        "google": "Google", "meta-llama": "Meta Llama", "mistralai": "Mistral AI",
+        "x-ai": "xAI", "qwen": "Qwen", "nvidia": "NVIDIA", "cohere": "Cohere",
+        "moonshotai": "Moonshot AI", "z-ai": "Z.ai", "poolside": "Poolside",
+    }
+    return known.get(provider.lower(), provider.replace("-", " ").title())
+
+
+def pretty_model(model: str) -> str:
+    """Turn 'deepseek/deepseek-v4-pro-0813[1m]' into 'DeepSeek V4 Pro 0813'."""
+    base = strip_context_suffix(model)
+    provider, _, rest = base.partition("/")
+    provider = provider.lstrip("~")
+    if not rest:
+        return base
+    variant = ""
+    if ":" in rest:
+        rest, _, variant = rest.partition(":")
+    parts = [part for part in re.split(r"[-_]", rest) if part]
+    if parts and parts[0].lower() == provider.lower():
+        parts = parts[1:]
+    words = []
+    for part in parts:
+        if re.fullmatch(r"v\d+(?:\.\d+)?", part, flags=re.I):
+            words.append(part.upper())
+        elif re.fullmatch(r"\d+(?:\.\d+)?", part):
+            words.append(part)
+        else:
+            words.append(part.capitalize())
+    label = f"{_pretty_provider(provider)} {' '.join(words)}".strip()
+    if variant:
+        label += f" ({variant})"
+    return label
+
+
+def classify_model(model: str) -> str:
+    """Derive a short preset name from a model id (pro / flash / max ...)."""
+    base = strip_context_suffix(model).lower()
+    last = base.rsplit("/", 1)[-1]
+    for token in ("pro", "flash", "max", "mini", "nano", "reasoner", "coder", "vision", "thinking"):
+        if token in last:
+            return token
+    words = [w for w in re.split(r"[-_.]", last)
+             if w and not re.fullmatch(r"v?\d+(?:\.\d+)*", w)
+             and w not in ("deepseek", "claude", "anthropic", "model", "latest", "preview")]
+    name = words[0] if words else "main"
+    name = re.sub(r"[^a-z0-9-]+", "", name)
+    return name or "main"
+
+
+def _seed_from_environment() -> dict:
+    env = os.environ
+    main = env.get("ANTHROPIC_MODEL") or env.get("ANTHROPIC_DEFAULT_OPUS_MODEL") \
+        or env.get("ANTHROPIC_DEFAULT_SONNET_MODEL")
+    small = env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL") or env.get("ANTHROPIC_SMALL_FAST_MODEL")
+    subagent = env.get("CLAUDE_CODE_SUBAGENT_MODEL")
+
+    presets: list[dict] = []
+    if main:
+        name = classify_model(main)
+        presets.append({
+            "name": name,
+            "label": pretty_model(main),
+            "primary": main,
+            "small": small or main,
+            "subagent": subagent or small or main,
+            "description": "Seeded from your current Claude Code environment",
+        })
+    if small and (not main or strip_context_suffix(small) != strip_context_suffix(main)):
+        name = classify_model(small)
+        if name in {p["name"] for p in presets}:
+            name = f"{name}-fast"
+        presets.append({
+            "name": name,
+            "label": pretty_model(small),
+            "primary": small,
+            "small": small,
+            "subagent": subagent or small,
+            "description": "Fast model for background tasks and subagents",
+        })
+    if not presets:
+        presets = [dict(p) for p in FALLBACK_PRESETS]
+    settings = dict(DEFAULT_SETTINGS)
+    if presets:
+        settings["default_small_model"] = presets[0]["small"]
+        settings["default_subagent_model"] = presets[0]["subagent"]
+    return {
+        "version": 1,
+        "settings": settings,
+        "presets": presets,
+        "current": {"preset": presets[0]["name"]},
+        "picker": {"installed": False, "previous": None},
+    }
+
+
+def save_config(cfg: dict) -> None:
+    atomic_write(config_path(), json.dumps(cfg, indent=2) + "\n")
+
+
+def load_config(auto_create: bool = True, allow_empty: bool = False) -> dict:
+    path = config_path()
+    if not path.exists():
+        if not auto_create:
+            raise CcmError(f"no ccm config at {path}; run `ccm install` or any ccm command first")
+        cfg = _seed_from_environment()
+        save_config(cfg)
+        return cfg
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CcmError(f"cannot parse {path}: {exc}\n  Fix the JSON, or move it away to let ccm recreate it.") from exc
+    if not isinstance(cfg, dict):
+        raise CcmError(f"{path} does not contain a JSON object")
+    cfg.setdefault("version", 1)
+    settings = dict(DEFAULT_SETTINGS)
+    if isinstance(cfg.get("settings"), dict):
+        settings.update(cfg["settings"])
+    cfg["settings"] = settings
+    presets = cfg.get("presets")
+    if not isinstance(presets, list):
+        raise CcmError(f"{path}: 'presets' must be a list")
+    if not presets:
+        if not allow_empty:
+            raise CcmError(f"{path} has no presets; add one with `ccm add <name> <model-id>`")
+        cfg["presets"] = []
+        cfg.setdefault("current", {})
+        if not isinstance(cfg.get("picker"), dict):
+            cfg["picker"] = {"installed": False, "previous": None}
+        return cfg
+    cleaned = []
+    for raw in presets:
+        if not isinstance(raw, dict) or not isinstance(raw.get("primary"), str) or not raw["primary"]:
+            raise CcmError(f"{path}: invalid preset entry: {raw!r}")
+        preset = dict(raw)
+        preset.setdefault("name", classify_model(preset["primary"]))
+        preset.setdefault("label", pretty_model(preset["primary"]))
+        preset.setdefault("small", preset["primary"])
+        preset.setdefault("subagent", preset["small"])
+        preset.setdefault("description", "")
+        cleaned.append(preset)
+    cfg["presets"] = cleaned
+    cfg.setdefault("current", {"preset": cleaned[0]["name"]})
+    if not isinstance(cfg.get("picker"), dict):
+        cfg["picker"] = {"installed": False, "previous": None}
+    return cfg
+
+
+def preset_map(cfg: dict) -> dict[str, dict]:
+    return {p["name"]: p for p in cfg["presets"]}
+
+
+def preset_names(cfg: dict) -> list[str]:
+    return [p["name"] for p in cfg["presets"]]
+
+
+def resolve_current(cfg: dict) -> dict:
+    if not cfg["presets"]:
+        raise CcmError("no presets configured; add one with `ccm add <name> <model-id>`")
+    presets = preset_map(cfg)
+    current = cfg.get("current") or {}
+    name = current.get("preset")
+    if name and name in presets:
+        preset = dict(presets[name])
+        preset["preset"] = name
+        preset["source"] = "preset"
+        return preset
+    if current.get("primary"):
+        return {
+            "name": current.get("name") or "",
+            "preset": None,
+            "label": current.get("label") or pretty_model(current["primary"]),
+            "primary": current["primary"],
+            "small": current.get("small") or current["primary"],
+            "subagent": current.get("subagent") or current.get("small") or current["primary"],
+            "description": current.get("description", ""),
+            "source": "custom",
+        }
+    preset = dict(cfg["presets"][0])
+    preset["preset"] = preset["name"]
+    preset["source"] = "preset"
+    return preset
+
+
+# ---------------------------------------------------------------------------
+# environment rendering
+# ---------------------------------------------------------------------------
+
+def _describe_model(model: str) -> str:
+    base = sanitize_text(strip_context_suffix(model))
+    suffix = " · 1M context" if has_context_suffix(model) else ""
+    return f"OpenRouter: {base}{suffix}"
+
+
+def env_vars_for(selection: dict) -> dict[str, str]:
+    primary = selection["primary"]
+    small = selection.get("small") or primary
+    subagent = selection.get("subagent") or small
+    label = sanitize_text(selection.get("label") or pretty_model(primary))
+    small_label = sanitize_text(pretty_model(small))
+    if strip_context_suffix(small) != strip_context_suffix(primary):
+        small_label += " (fast)"
+    return {
+        "ANTHROPIC_MODEL": primary,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": primary,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": primary,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": small,
+        "CLAUDE_CODE_SUBAGENT_MODEL": subagent,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": label,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": label,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": small_label,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION": _describe_model(primary),
+        "ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION": _describe_model(primary),
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION": _describe_model(small) + " · background tasks",
+    }
+
+
+def fish_quote(text: str) -> str:
+    return "'" + str(text).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def sh_quote(text: str) -> str:
+    return "'" + str(text).replace("'", "'\\''") + "'"
+
+
+def render_env_fish(cfg: dict, selection: dict) -> str:
+    label = sanitize_text(selection.get("label") or pretty_model(selection["primary"]))
+    lines = [
+        f"# Generated by ccm {VERSION} — do not edit; run `ccm use <preset>` instead.",
+        f"# active: {label}  ({sanitize_text(selection['primary'])})",
+        f"# vision: {sanitize_text(describe_vision(selection, cfg))}",
+    ]
+    for name in MANAGED_ENV_VARS:
+        lines.append(f"set -q {name}; and set -e -g {name}")
+    mapping = {**env_vars_for(selection), **vision_env_for(cfg, selection)}
+    for name, value in mapping.items():
+        lines.append(f"set -gx {name} {fish_quote(value)}")
+    return "\n".join(lines) + "\n"
+
+
+def render_env_sh(cfg: dict, selection: dict) -> str:
+    label = sanitize_text(selection.get("label") or pretty_model(selection["primary"]))
+    lines = [
+        f"# Generated by ccm {VERSION} — do not edit; run `ccm use <preset>` instead.",
+        f"# active: {label}  ({sanitize_text(selection['primary'])})",
+        f"# vision: {sanitize_text(describe_vision(selection, cfg))}",
+        "unset " + " ".join(MANAGED_ENV_VARS),
+    ]
+    mapping = {**env_vars_for(selection), **vision_env_for(cfg, selection)}
+    for name, value in mapping.items():
+        lines.append(f"export {name}={sh_quote(value)}")
+    return "\n".join(lines) + "\n"
+
+
+def write_env_files(cfg: dict, selection: dict) -> None:
+    atomic_write(env_fish_path(), render_env_fish(cfg, selection), mode=0o644)
+    atomic_write(env_sh_path(), render_env_sh(cfg, selection), mode=0o644)
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter catalog cache
+# ---------------------------------------------------------------------------
+
+def _safe_float(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def fetch_models(cfg: dict) -> list[dict]:
+    url = cfg["settings"].get("models_url") or OPENROUTER_MODELS_URL
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": f"ccm/{VERSION}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = response.read()
+    except urllib.error.HTTPError as exc:
+        raise CcmError(f"model catalog request failed: HTTP {exc.code} from {url}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise CcmError(f"model catalog request failed: {exc}\n  Check your network, or keep using the cached list.") from exc
+    try:
+        data = json.loads(payload)
+    except ValueError as exc:
+        raise CcmError(f"model catalog response from {url} was not valid JSON") from exc
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        raise CcmError(f"unexpected model catalog response from {url} (no 'data' list)")
+    models: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        architecture = item.get("architecture") or {}
+        modalities = architecture.get("output_modalities") or []
+        if not isinstance(modalities, list):
+            modalities = []
+        input_modalities = architecture.get("input_modalities") or []
+        if not isinstance(input_modalities, list):
+            input_modalities = []
+        pricing = item.get("pricing") or {}
+        supported = item.get("supported_parameters") or []
+        models.append({
+            "id": item["id"],
+            "name": item.get("name") or item["id"],
+            "description": (item.get("description") or "")[:400],
+            "context_length": item.get("context_length"),
+            "pricing": {
+                "prompt": _safe_float(pricing.get("prompt")),
+                "completion": _safe_float(pricing.get("completion")),
+            },
+            "supports_tools": "tools" in supported,
+            "output_modalities": modalities,
+            "input_modalities": [str(value) for value in input_modalities],
+        })
+    return models
+
+
+def load_cache() -> dict | None:
+    path = cache_path()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        return None
+    return {"fetched_at": _safe_float(data.get("fetched_at")), "models": models}
+
+
+def save_cache(models: list[dict]) -> None:
+    atomic_write(cache_path(), json.dumps({
+        "fetched_at": time.time(),
+        "models": models,
+    }))
+
+
+def age_hours(timestamp: float) -> float:
+    return max(0.0, (time.time() - timestamp) / 3600.0)
+
+
+def describe_age(timestamp: float) -> str:
+    hours = age_hours(timestamp)
+    if hours < 1:
+        return f"{int(hours * 60)} min ago"
+    if hours < 48:
+        return f"{hours:.1f} hours ago"
+    return f"{hours / 24:.1f} days ago"
+
+
+def get_catalog(cfg: dict, allow_network: bool = True) -> list[dict]:
+    cache = load_cache()
+    ttl = _safe_float(cfg["settings"].get("cache_ttl_hours") or 24) * 3600
+    if cache and (time.time() - cache["fetched_at"]) < ttl:
+        return cache["models"]
+    if not allow_network:
+        if cache:
+            return cache["models"]
+        raise CcmError("no cached model catalog yet; run `ccm refresh` first")
+    try:
+        models = fetch_models(cfg)
+    except CcmError as exc:
+        if cache:
+            warn(f"{exc}; using cached catalog from {describe_age(cache['fetched_at'])}")
+            return cache["models"]
+        raise
+    save_cache(models)
+    return models
+
+
+def lookup_model(models: list[dict], model: str) -> dict | None:
+    base = strip_context_suffix(model).lower()
+    for item in models:
+        if item.get("id", "").lower() == base:
+            return item
+    return None
+
+
+def clean_catalog_label(name: str, model: str) -> str:
+    """Shorten 'DeepSeek: DeepSeek V4 Flash' to 'DeepSeek V4 Flash'."""
+    label = (name or "").strip()
+    provider = strip_context_suffix(model).partition("/")[0].lstrip("~")
+    for prefix in (f"{_pretty_provider(provider)}: ", f"{provider}: "):
+        if label.lower().startswith(prefix.lower()):
+            label = label[len(prefix):].strip()
+            break
+    return sanitize_text(label or name)
+
+
+def catalog_label(models: list[dict] | None, model: str) -> str | None:
+    if not models:
+        return None
+    item = lookup_model(models, model)
+    return clean_catalog_label(item.get("name") or "", model) if item else None
+
+
+def cached_catalog() -> list[dict] | None:
+    cache = load_cache()
+    return cache["models"] if cache else None
+
+
+def maybe_append_1m(cfg: dict, model: str) -> str:
+    if has_context_suffix(model):
+        return model
+    models = cached_catalog()
+    if not models:
+        return model
+    item = lookup_model(models, model)
+    if not item:
+        return model
+    context = item.get("context_length") or 0
+    try:
+        context = int(context)
+    except (TypeError, ValueError):
+        return model
+    if context >= 1_000_000 and cfg["settings"].get("auto_append_1m", True):
+        return strip_context_suffix(model) + "[1m]"
+    return model
+
+
+def _is_small_model(model: str) -> bool:
+    base = strip_context_suffix(model).lower()
+    return any(hint in base.rsplit("/", 1)[-1] for hint in SMALL_MODEL_HINTS)
+
+
+def choose_small_model(cfg: dict, model: str) -> str:
+    if _is_small_model(model):
+        return model
+    return cfg["settings"].get("default_small_model") or model
+
+
+def choose_subagent_model(cfg: dict, model: str) -> str:
+    if _is_small_model(model):
+        return model
+    return cfg["settings"].get("default_subagent_model") \
+        or cfg["settings"].get("default_small_model") or model
+
+
+# ---------------------------------------------------------------------------
+# automatic vision routing (text-only DeepSeek models + Gemini image hook)
+# ---------------------------------------------------------------------------
+# The user's DeepSeek main models cannot see images, so their vision hook
+# (~/.deepseek-vl/config.json, Gemini via OpenRouter) describes image Reads.
+# ccm exports VISION_MODEL / VISION_DISABLE per preset:
+#   * text-only main model        -> hook enabled (Gemini describes images)
+#   * main + subagent see images  -> VISION_DISABLE=1 (native, hook skipped)
+# The hook's own model config is respected unless `ccm vision model` overrides it.
+
+VISION_CONFIG_DIR = ".deepseek-vl"
+VISION_CONFIG_FILENAME = "config.json"
+VISION_AUTO = "auto"
+VISION_NATIVE = "native"
+VISION_DESCRIBE = "describe"
+VISION_MODES = (VISION_AUTO, VISION_NATIVE, VISION_DESCRIBE)
+
+
+def vision_config_path() -> Path:
+    return home_dir() / VISION_CONFIG_DIR / VISION_CONFIG_FILENAME
+
+
+def detected_vision_model() -> str | None:
+    path = vision_config_path()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    model = data.get("model") if isinstance(data, dict) else None
+    if isinstance(model, str) and model.strip():
+        return sanitize_text(model)
+    return None
+
+
+def vision_hook_present() -> bool:
+    return vision_config_path().exists()
+
+
+def vision_model_id(cfg: dict) -> str:
+    return sanitize_text(cfg["settings"].get("vision_model") or detected_vision_model() or "")
+
+
+def model_vision_support(models: list[dict] | None, model: str) -> bool | None:
+    """True/False when the OpenRouter catalog knows the model's input modalities."""
+    if not models:
+        return None
+    item = lookup_model(models, model)
+    if not item:
+        return None
+    inputs = item.get("input_modalities")
+    if not isinstance(inputs, list) or not inputs:
+        return None
+    return "image" in {str(value).lower() for value in inputs}
+
+
+def effective_vision_mode(cfg: dict, selection: dict) -> str | None:
+    """Return native/describe, or None when ccm does not manage vision vars."""
+    if not cfg["settings"].get("vision_auto", True):
+        return None
+    override = sanitize_text(selection.get("vision") or VISION_AUTO).lower()
+    if override in (VISION_NATIVE, VISION_DESCRIBE):
+        return override
+    models = cached_catalog()
+    primary_ok = model_vision_support(models, selection["primary"])
+    subagent = selection.get("subagent") or selection.get("small") or selection["primary"]
+    subagent_ok = model_vision_support(models, subagent)
+    # Disable the hook only when every model that might read an image can see
+    # images natively. Unknown capability keeps the safe Gemini description path.
+    if primary_ok is True and subagent_ok is True:
+        return VISION_NATIVE
+    return VISION_DESCRIBE
+
+
+def vision_env_for(cfg: dict, selection: dict) -> dict[str, str]:
+    mode = effective_vision_mode(cfg, selection)
+    if mode is None:
+        return {}
+    if mode == VISION_NATIVE:
+        return {"VISION_DISABLE": "1"}
+    # Only export an explicit override; otherwise the hook uses its own config.
+    model = sanitize_text(cfg["settings"].get("vision_model") or "")
+    return {"VISION_MODEL": model} if model else {}
+
+
+def vision_status(cfg: dict, selection: dict) -> dict:
+    models = cached_catalog()
+    subagent = selection.get("subagent") or selection.get("small")
+    return {
+        "managed": bool(cfg["settings"].get("vision_auto", True)),
+        "mode": effective_vision_mode(cfg, selection),
+        "vision_model": vision_model_id(cfg) or None,
+        "hook_config": str(vision_config_path()) if vision_hook_present() else None,
+        "primary_supports_images": model_vision_support(models, selection["primary"]),
+        "subagent_supports_images": model_vision_support(models, subagent) if subagent else None,
+        "env": vision_env_for(cfg, selection),
+    }
+
+
+def describe_vision(selection: dict, cfg: dict) -> str:
+    if not cfg["settings"].get("vision_auto", True):
+        return "not managed by ccm"
+    mode = effective_vision_mode(cfg, selection)
+    if mode == VISION_NATIVE:
+        return "native (model reads images; vision hook disabled)"
+    model = vision_model_id(cfg) or "hook's own config"
+    return f"Gemini describes images ({model})"
+
+
+# ---------------------------------------------------------------------------
+# selection + persistence
+# ---------------------------------------------------------------------------
+
+def _selection_for_model(cfg: dict, model: str, *, label: str | None = None,
+                         small: str | None = None, subagent: str | None = None,
+                         auto_1m: bool = True, vision: str | None = None) -> dict:
+    model = model.strip()
+    base = strip_context_suffix(model)
+    if not looks_like_model_id(model):
+        raise CcmError(
+            f"'{model}' is not a preset and does not look like an OpenRouter model id "
+            f"(expected 'provider/model', e.g. deepseek/deepseek-v4-pro-0813).\n"
+            f"  Known presets: {', '.join(preset_names(cfg)) or '(none)'}\n"
+            f"  Search the catalog with: ccm search <query>"
+        )
+    for option, value in (("small", small), ("subagent", subagent)):
+        if value and not looks_like_model_id(value):
+            raise CcmError(f"--{option} must be a model id like 'provider/model'")
+    if auto_1m and not has_context_suffix(model):
+        model = maybe_append_1m(cfg, model)
+    label = sanitize_text(label or catalog_label(cached_catalog(), model) or pretty_model(model))
+    small_model = small or choose_small_model(cfg, model)
+    sub_model = subagent or choose_subagent_model(cfg, model)
+    selection = {
+        "name": classify_model(model),
+        "label": label,
+        "primary": model,
+        "small": small_model,
+        "subagent": sub_model,
+        "description": f"Ad-hoc model: {model}",
+        "preset": None,
+        "source": "model",
+    }
+    if vision:
+        if vision not in VISION_MODES:
+            raise CcmError(f"invalid vision mode '{vision}' (choose auto, native or describe)")
+        selection["vision"] = vision
+    return selection
+
+
+def selection_for_target(cfg: dict, target: str | None) -> dict:
+    if not target:
+        return resolve_current(cfg)
+    presets = preset_map(cfg)
+    if target in presets:
+        selection = dict(presets[target])
+        selection["preset"] = target
+        selection["source"] = "preset"
+        return selection
+    return _selection_for_model(cfg, target)
+
+
+def apply_selection(cfg: dict, selection: dict) -> None:
+    if selection.get("preset"):
+        cfg["current"] = {"preset": selection["preset"]}
+    else:
+        cfg["current"] = {
+            "preset": None,
+            "label": selection["label"],
+            "primary": selection["primary"],
+            "small": selection["small"],
+            "subagent": selection["subagent"],
+        }
+    write_env_files(cfg, selection)
+    if (cfg.get("picker") or {}).get("installed"):
+        try:
+            sync_picker_settings(cfg, announce=False)
+        except CcmError as exc:
+            warn(f"could not update /model picker settings: {exc}")
+    save_config(cfg)
+
+
+def _shell_is_fish() -> bool:
+    return os.environ.get("SHELL", "").rsplit("/", 1)[-1] == "fish"
+
+
+def print_activation_hint(selection: dict) -> None:
+    if _shell_is_fish():
+        info("  Start Claude Code with: claude   (fish wrapper re-sourced env.fish)")
+        info("  New terminals use this preset automatically.")
+    else:
+        info(f"  Apply in this shell: source {env_sh_path()}")
+        info("  Then start Claude Code with: claude")
+    info(f"  Already inside a Claude Code session? Use: /model {selection['primary']}"
+         "  (session only; ccm use persists the default)")
+
+
+def print_selection(selection: dict, cfg: dict | None = None) -> None:
+    label = selection.get("label") or pretty_model(selection["primary"])
+    ok(f"active model: {label}")
+    info(f"  primary   {selection['primary']}")
+    small = selection.get("small") or selection["primary"]
+    subagent = selection.get("subagent") or small
+    fast_note = "  (haiku alias / background tasks)"
+    info(f"  fast      {small}{fast_note}")
+    info(f"  subagent  {subagent}")
+    if cfg is not None:
+        info(f"  vision    {describe_vision(selection, cfg)}")
+
+
+def do_use(cfg: dict, target: str, *, small: str | None = None,
+           subagent: str | None = None, label: str | None = None,
+           force_1m: bool = False, no_1m: bool = False,
+           vision: str | None = None) -> dict:
+    presets = preset_map(cfg)
+    if target in presets:
+        if small or subagent or label or force_1m or no_1m or vision:
+            raise CcmError("--small/--subagent/--label/--1m/--vision only apply to raw model ids, not presets")
+        selection = dict(presets[target])
+        selection["preset"] = target
+        selection["source"] = "preset"
+    else:
+        model = target.strip()
+        if force_1m and not has_context_suffix(model):
+            model = strip_context_suffix(model) + "[1m]"
+        elif no_1m:
+            model = strip_context_suffix(model)
+        selection = _selection_for_model(cfg, model, label=label, small=small,
+                                         subagent=subagent, auto_1m=not no_1m,
+                                         vision=vision)
+    apply_selection(cfg, selection)
+    return selection
+
+
+# ---------------------------------------------------------------------------
+# picker settings (~/.claude/settings.json) — optional in-session /model rows
+# ---------------------------------------------------------------------------
+
+def load_claude_settings() -> tuple[dict, int]:
+    path = claude_settings_path()
+    if not path.exists():
+        return {}, 0o644
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CcmError(f"cannot parse {path}: {exc}\n  Fix it before using `ccm picker`.") from exc
+    if not isinstance(data, dict):
+        raise CcmError(f"{path} does not contain a JSON object")
+    return data, (path.stat().st_mode & 0o777)
+
+
+def save_claude_settings(settings: dict, mode: int) -> None:
+    path = claude_settings_path()
+    if path.exists():
+        backup_once(path)
+    atomic_write(path, json.dumps(settings, indent=2) + "\n", mode=mode)
+
+
+def picker_rows(cfg: dict) -> list[dict]:
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for preset in cfg["presets"]:
+        model = preset["primary"]
+        base = strip_context_suffix(model)
+        if base in seen:
+            continue
+        seen.add(base)
+        row = {
+            "model": model,
+            "label": sanitize_text(preset.get("label") or pretty_model(model)),
+        }
+        if preset.get("description"):
+            row["description"] = sanitize_text(preset["description"])
+        rows.append(row)
+    current = resolve_current(cfg)
+    small = current.get("small")
+    if small and strip_context_suffix(small) != strip_context_suffix(current["primary"]):
+        base = strip_context_suffix(small)
+        if base not in seen:
+            seen.add(base)
+            rows.append({
+                "model": small,
+                "label": sanitize_text(pretty_model(small)) + " · fast",
+                "description": "Fast model for background tasks and subagents",
+            })
+    return rows
+
+
+def sync_picker_settings(cfg: dict, announce: bool = False) -> None:
+    settings, mode = load_claude_settings()
+    settings["modelPicker"] = {"options": picker_rows(cfg), "replaceBuiltInOptions": True}
+    save_claude_settings(settings, mode)
+    if announce:
+        ok(f"updated {claude_settings_path()} modelPicker rows")
+
+
+def picker_install(cfg: dict) -> None:
+    settings, mode = load_claude_settings()
+    state = cfg.setdefault("picker", {"installed": False, "previous": None})
+    if not state.get("installed"):
+        state["previous"] = settings.get("modelPicker")
+        state["installed"] = True
+    settings["modelPicker"] = {"options": picker_rows(cfg), "replaceBuiltInOptions": True}
+    save_claude_settings(settings, mode)
+    cfg["picker"] = state
+    save_config(cfg)
+    ok(f"in-session /model picker updated in {claude_settings_path()}")
+    info("  Rows: " + ", ".join(row["label"] for row in picker_rows(cfg)))
+    info("  Restart Claude Code, then run /model to pick a row.")
+
+
+def picker_remove(cfg: dict, quiet: bool = False) -> None:
+    state = cfg.get("picker") or {}
+    if not state.get("installed"):
+        if not quiet:
+            warn("ccm does not manage the /model picker right now")
+        return
+    settings, mode = load_claude_settings()
+    previous = state.get("previous")
+    if previous is None:
+        settings.pop("modelPicker", None)
+    else:
+        settings["modelPicker"] = previous
+    save_claude_settings(settings, mode)
+    state["installed"] = False
+    state["previous"] = None
+    cfg["picker"] = state
+    save_config(cfg)
+    if not quiet:
+        ok(f"removed ccm's /model picker rows from {claude_settings_path()}")
+
+
+def picker_status(cfg: dict) -> int:
+    state = cfg.get("picker") or {}
+    installed = bool(state.get("installed"))
+    settings, _ = load_claude_settings()
+    present = isinstance(settings.get("modelPicker"), dict)
+    rows = picker_rows(cfg)
+    if installed:
+        ok(f"/model picker rows: installed in {claude_settings_path()} ({len(rows)} rows)")
+        expected = {"options": rows, "replaceBuiltInOptions": True}
+        if settings.get("modelPicker") != expected:
+            warn("settings modelPicker differs from ccm's presets; run `ccm picker on` to resync")
+            return 0
+        info("  In sync with ccm presets.")
+    else:
+        warn("ccm's /model picker rows are not installed (run `ccm picker on` to enable)")
+        if present:
+            info("  (Another modelPicker is configured in settings; ccm left it alone.)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# fish integration
+# ---------------------------------------------------------------------------
+
+def fish_wrapper_text() -> str:
+    env_path = fish_quote(str(env_fish_path()))
+    return f"""# {MARKER} — installed by `ccm install`, removed by `ccm uninstall`
+function ccm --description 'Claude Code model switcher (OpenRouter)'
+    command ccm $argv
+    set -l __ccm_status $status
+    if test -f {env_path}
+        source {env_path}
+    end
+    return $__ccm_status
+end
+"""
+
+
+def fish_completions_text() -> str:
+    return f"""# {MARKER}
+complete -c ccm -f
+complete -c ccm -n '__fish_use_subcommand' -a 'list current use pick run search add remove refresh env install uninstall picker vision doctor completions help'
+complete -c ccm -n '__fish_seen_subcommand_from vision' -a 'status model auto on off'
+complete -c ccm -n '__fish_seen_subcommand_from use run remove env' -a '(command ccm __presets 2>/dev/null)'
+complete -c ccm -n '__fish_seen_subcommand_from picker' -a 'on off status'
+complete -c ccm -n '__fish_seen_subcommand_from completions' -a 'fish'
+"""
+
+
+FISH_BLOCK_RE = re.compile(
+    re.escape(FISH_BLOCK_BEGIN) + r".*?" + re.escape(FISH_BLOCK_END),
+    re.S,
+)
+
+
+def fish_block_present() -> bool:
+    path = fish_config_path()
+    return path.exists() and FISH_BLOCK_BEGIN in read_text(path)
+
+
+def ensure_fish_block() -> Path:
+    path = fish_config_path()
+    text = read_text(path) if path.exists() else ""
+    if FISH_BLOCK_BEGIN in text and not FISH_BLOCK_RE.search(text):
+        raise CcmError(
+            f"{path}: found a ccm start marker without a matching end marker; "
+            f"fix or remove that line before running `ccm install`"
+        )
+    if FISH_BLOCK_END in text and FISH_BLOCK_BEGIN not in text:
+        raise CcmError(
+            f"{path}: found a ccm end marker without a matching start marker; "
+            f"remove that line before running `ccm install`"
+        )
+    block = (
+        f"{FISH_BLOCK_BEGIN}\n"
+        f"# Managed by ccm — replaced on `ccm install`, removed by `ccm uninstall`.\n"
+        f"source {fish_quote(str(env_fish_path()))}\n"
+        f"{FISH_BLOCK_END}\n"
+    )
+    if FISH_BLOCK_RE.search(text):
+        new_text = FISH_BLOCK_RE.sub(block.rstrip("\n"), text, count=1)
+    else:
+        new_text = (text.rstrip("\n") + "\n\n" if text.strip() else "") + block
+    if new_text != text:
+        backup_once(path)
+        atomic_write(path, new_text, mode=(path.stat().st_mode & 0o777) if path.exists() else 0o644)
+    return path
+
+
+def remove_fish_block() -> bool:
+    path = fish_config_path()
+    if not path.exists():
+        return False
+    text = read_text(path)
+    if FISH_BLOCK_BEGIN not in text:
+        if FISH_BLOCK_END in text:
+            raise CcmError(
+                f"{path}: found a ccm end marker without a matching start marker; "
+                f"fix it manually before uninstalling"
+            )
+        return False
+    if not FISH_BLOCK_RE.search(text):
+        raise CcmError(
+            f"{path}: found a ccm start marker without a matching end marker; "
+            f"fix it manually before uninstalling"
+        )
+    mode = path.stat().st_mode & 0o777
+    new_text = FISH_BLOCK_RE.sub("", text, count=1)
+    if new_text.strip():
+        atomic_write(path, new_text.rstrip("\n") + "\n", mode=mode)
+    else:
+        path.unlink()  # config.fish held nothing but ccm's block
+    return True
+
+
+def validate_fish_markers() -> None:
+    path = fish_config_path()
+    if not path.exists():
+        return
+    text = read_text(path)
+    if FISH_BLOCK_BEGIN in text and not FISH_BLOCK_RE.search(text):
+        raise CcmError(
+            f"{path}: found a ccm start marker without a matching end marker; "
+            f"fix or remove that line before running `ccm install`"
+        )
+    if FISH_BLOCK_END in text and FISH_BLOCK_BEGIN not in text:
+        raise CcmError(
+            f"{path}: found a ccm end marker without a matching start marker; "
+            f"remove that line before running `ccm install`"
+        )
+
+
+def remove_if_ours(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if MARKER not in content:
+        return False
+    path.unlink()
+    return True
+
+
+def install_fish_integration() -> list[str]:
+    installed: list[str] = []
+    functions = fish_function_path()
+    completions = fish_completions_path()
+    atomic_write(functions, fish_wrapper_text(), mode=0o644)
+    installed.append(str(functions))
+    atomic_write(completions, fish_completions_text(), mode=0o644)
+    installed.append(str(completions))
+    installed.append(str(ensure_fish_block()))
+    return installed
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+def cmd_list(args) -> int:
+    cfg = load_config()
+    current = resolve_current(cfg)
+    current_name = current.get("preset")
+    payload = {
+        "current": {
+            "preset": current_name,
+            "label": current.get("label"),
+            "primary": current["primary"],
+            "small": current["small"],
+            "subagent": current["subagent"],
+        },
+        "presets": cfg["presets"],
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+    width = max(len(p["name"]) for p in cfg["presets"])
+    for preset in cfg["presets"]:
+        marker = "*" if preset["name"] == current_name else " "
+        label = preset.get("label") or pretty_model(preset["primary"])
+        if args.oneline:
+            print(f"{marker} {preset['name']:<{width}}  {preset['primary']}")
+            continue
+        print(f"{marker} {preset['name']:<{width}}  {label}")
+        print(f"    primary   {preset['primary']}")
+        if preset.get("small") and preset["small"] != preset["primary"]:
+            print(f"    fast      {preset['small']}")
+        if preset.get("subagent") and preset["subagent"] not in (preset["primary"], preset.get("small")):
+            print(f"    subagent  {preset['subagent']}")
+    if not current_name:
+        print()
+        print(f"* (custom)  {current.get('label')}")
+        print(f"    primary   {current['primary']}")
+        print(f"    fast      {current['small']}")
+        print(f"    subagent  {current['subagent']}")
+    return 0
+
+
+def cmd_current(args) -> int:
+    cfg = load_config()
+    selection = resolve_current(cfg)
+    expected = env_vars_for(selection)
+    actual = {name: os.environ.get(name) for name in MANAGED_ENV_VARS}
+    core_expected = {name: value for name, value in expected.items() if name in CORE_ENV_VARS}
+    missing = [name for name in core_expected if actual.get(name) is None]
+    differing = [name for name in core_expected
+                 if actual.get(name) is not None and actual[name] != core_expected[name]]
+    optional_missing = [name for name in expected
+                        if name not in CORE_ENV_VARS and actual.get(name) is None]
+    env_loaded = not missing and not differing
+    payload = {
+        "configured": {
+            "preset": selection.get("preset"),
+            "label": selection.get("label"),
+            "primary": selection["primary"],
+            "small": selection["small"],
+            "subagent": selection["subagent"],
+        },
+        "shell_env": {name: actual[name] for name in expected if actual.get(name) is not None},
+        "env_matches": env_loaded,
+        "missing_env": missing,
+        "differing_env": differing,
+        "optional_env_missing": optional_missing,
+        "vision": vision_status(cfg, selection),
+        "files": {
+            "config": str(config_path()),
+            "env_fish": str(env_fish_path()),
+            "env_sh": str(env_sh_path()),
+            "fish_block": fish_block_present(),
+            "fish_function": fish_function_path().exists(),
+            "binary": shutil.which("ccm"),
+        },
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+    print_selection(selection, cfg)
+    print()
+    if env_loaded:
+        ok("shell environment matches — Claude Code will use this model")
+    elif missing and len(missing) == len(core_expected):
+        warn("shell environment not loaded in this shell")
+        if _shell_is_fish():
+            info("  Open a new terminal, or run: source " + str(env_fish_path()))
+        else:
+            info(f"  Run: source {env_sh_path()}")
+    else:
+        if differing:
+            warn("shell environment differs from ccm's config:")
+            for name in differing:
+                info(f"  {name}={actual[name]}")
+            info("  Run `ccm use` again, or re-source the env file to resync.")
+        if missing:
+            warn("some model env vars are unset in this shell: " + ", ".join(missing))
+    print()
+    info(f"  config     {config_path()}")
+    info(f"  env files  {env_fish_path()}")
+    info(f"  fish hook  {'installed' if fish_block_present() else 'not installed (run ccm install)'}")
+    return 0
+
+
+def cmd_use(args) -> int:
+    cfg = load_config()
+    selection = do_use(
+        cfg, args.target,
+        small=args.small, subagent=args.subagent, label=args.label,
+        force_1m=args.context == "1m", no_1m=args.context == "no",
+        vision=args.vision,
+    )
+    print_selection(selection, cfg)
+    print_activation_hint(selection)
+    return 0
+
+
+def cmd_env(args) -> int:
+    cfg = load_config()
+    selection = selection_for_target(cfg, args.target)
+    shell = args.shell
+    if shell == "auto":
+        shell = "fish" if _shell_is_fish() else "sh"
+    print(render_env_fish(cfg, selection) if shell == "fish" else render_env_sh(cfg, selection), end="")
+    return 0
+
+
+def _filter_catalog(models: list[dict], query: str, include_all: bool) -> list[dict]:
+    terms = [term for term in re.split(r"\s+", query.strip().lower()) if term]
+    matches = []
+    for item in models:
+        if not include_all:
+            modalities = item.get("output_modalities") or []
+            if modalities and "text" not in modalities:
+                continue
+            if not item.get("supports_tools"):
+                continue
+        haystack = f"{item.get('id', '')} {item.get('name', '')}".lower()
+        if all(term in haystack for term in terms):
+            matches.append(item)
+
+    def rank(item: dict):
+        ident = item.get("id", "").lower()
+        starts = 0 if (not terms or ident.startswith(terms[0])) else 1
+        return (starts, len(ident), ident)
+
+    matches.sort(key=rank)
+    return matches
+
+
+def format_context(item: dict) -> str:
+    context = item.get("context_length")
+    try:
+        context = int(context)
+    except (TypeError, ValueError):
+        return "?"
+    if context >= 1_000_000:
+        return f"{context / 1_000_000:.1f}M"
+    if context >= 1_000:
+        return f"{context // 1_000}K"
+    return str(context)
+
+
+def format_price(item: dict) -> str:
+    pricing = item.get("pricing") or {}
+    prompt = _safe_float(pricing.get("prompt")) * 1_000_000
+    completion = _safe_float(pricing.get("completion")) * 1_000_000
+    if prompt <= 0 and completion <= 0:
+        return "free"
+    return f"${prompt:.2f}/${completion:.2f}"
+
+
+def _print_catalog_rows(matches: list[dict]) -> None:
+    if not matches:
+        info("  (no matches — try a broader query or `ccm refresh`)")
+        return
+    id_width = min(58, max(len(item.get("id", "")) for item in matches) + 2)
+    info(f"  {'#':>3}  {'MODEL ID':<{id_width}}  {'CTX':>6}  {'$/M in/out':>12}  NAME")
+    for index, item in enumerate(matches, start=1):
+        name = (item.get("name") or "")[:60]
+        info(f"  {index:>3}  {item.get('id', '')[:id_width]:<{id_width}}  "
+             f"{format_context(item):>6}  {format_price(item):>12}  {name}")
+
+
+def cmd_search(args) -> int:
+    cfg = load_config()
+    models = get_catalog(cfg, allow_network=True)
+    matches = _filter_catalog(models, args.query, include_all=args.all)
+    if args.limit and args.limit > 0:
+        matches = matches[:args.limit]
+    if args.json:
+        print(json.dumps(matches, indent=2))
+        return 0
+    info(f"OpenRouter models matching '{args.query}':")
+    _print_catalog_rows(matches)
+    if args.interactive:
+        if not matches:
+            return 0
+        if not sys.stdin.isatty():
+            raise CcmError("--interactive needs a terminal")
+        raw = input(f"Pick a number 1-{len(matches)} (Enter to cancel): ").strip()
+        if not raw:
+            return 0
+        try:
+            index = int(raw)
+            chosen = matches[index - 1]
+        except (ValueError, IndexError):
+            raise CcmError(f"invalid selection: {raw!r}") from None
+        selection = do_use(cfg, chosen["id"], label=clean_catalog_label(chosen.get("name") or "", chosen["id"]))
+        print()
+        print_selection(selection, cfg)
+        print_activation_hint(selection)
+    else:
+        info("\nUse one with: ccm use <model-id>   (or ccm search -i <query>)")
+    return 0
+
+
+def _fallback_pick(cfg: dict) -> str | None:
+    presets = cfg["presets"]
+    current = resolve_current(cfg)
+    info("Choose a preset:")
+    for index, preset in enumerate(presets, start=1):
+        marker = "*" if preset["name"] == current.get("preset") else " "
+        info(f"  {marker}{index}. {preset['name']:<12} {preset.get('label') or ''}")
+    info("  q. cancel")
+    raw = input("> ").strip()
+    if not raw or raw.lower() in ("q", "quit", "exit"):
+        return None
+    if raw.isdigit():
+        index = int(raw)
+        if 1 <= index <= len(presets):
+            return presets[index - 1]["name"]
+        raise CcmError(f"invalid selection: {raw}")
+    if raw in preset_map(cfg) or looks_like_model_id(raw):
+        return raw
+    raise CcmError(f"unknown preset or model id: {raw!r}")
+
+
+def cmd_pick(args) -> int:
+    cfg = load_config()
+    current = resolve_current(cfg)
+    entries: list[str] = []
+    for preset in cfg["presets"]:
+        marker = "* " if preset["name"] == current.get("preset") else "  "
+        label = preset.get("label") or pretty_model(preset["primary"])
+        display = f"{marker}{preset['name']:<12}  {label}  ·  {preset['primary']}"
+        entries.append(f"preset\t{display}\t{preset['name']}")
+    models = cached_catalog()
+    if models:
+        shown = 0
+        for item in _filter_catalog(models, "", include_all=False):
+            display = (f"   {'':<12}  {item['id']}  ·  {format_context(item)}  ·  "
+                       f"{format_price(item)}  ·  {(item.get('name') or '')[:50]}")
+            entries.append(f"model\t{display}\t{item['id']}")
+            shown += 1
+            if shown >= 500:
+                break
+    fzf = shutil.which("fzf")
+    selected: tuple[str, str] | None = None
+    if fzf and sys.stdin.isatty():
+        header = ("Enter = set as default · Esc = cancel · type to filter · "
+                  "`ccm refresh` updates the model list")
+        try:
+            proc = subprocess.run(
+                [fzf, "--delimiter=\t", "--with-nth=2", "--nth=2",
+                 "--prompt=ccm> ", "--header=" + header,
+                 "--height=90%", "--layout=reverse", "--info=inline"],
+                input="\n".join(entries), capture_output=True, text=True,
+            )
+        except OSError as exc:
+            raise CcmError(f"could not run fzf: {exc}") from exc
+        if proc.returncode not in (0, 130):
+            raise CcmError(f"fzf failed: {proc.stderr.strip()}")
+        if proc.stdout.strip():
+            parts = proc.stdout.splitlines()[0].split("\t")
+            if len(parts) >= 3:
+                selected = (parts[0], parts[2])
+    elif not sys.stdin.isatty():
+        raise CcmError("the picker needs a terminal; use `ccm use <preset>` instead")
+    else:
+        target = _fallback_pick(cfg)
+        if target:
+            selected = ("preset" if target in preset_map(cfg) else "model", target)
+    if not selected:
+        return 0
+    kind, value = selected
+    label = None
+    if kind == "model" and models:
+        item = lookup_model(models, value)
+        label = clean_catalog_label(item.get("name") or "", value) if item else None
+    selection = do_use(cfg, value, label=label)
+    print_selection(selection, cfg)
+    print_activation_hint(selection)
+    return 0
+
+
+def cmd_refresh(args) -> int:
+    cfg = load_config()
+    models = fetch_models(cfg)
+    save_cache(models)
+    if args.json:
+        print(json.dumps({"count": len(models), "fetched_at": time.time()}, indent=2))
+        return 0
+    ok(f"model catalog refreshed: {len(models)} models")
+    info(f"  cached at {cache_path()}")
+    return 0
+
+
+def cmd_add(args) -> int:
+    cfg = load_config(allow_empty=True)
+    name = args.name.strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+        raise CcmError("preset name must match [A-Za-z0-9][A-Za-z0-9._-]*")
+    if name in COMMANDS:
+        raise CcmError(f"'{name}' is reserved for a ccm command; pick another preset name")
+    if args.vision and args.vision not in VISION_MODES:
+        raise CcmError(f"invalid vision mode '{args.vision}' (choose auto, native or describe)")
+    existing = preset_map(cfg)
+    if name in existing and not args.force:
+        raise CcmError(f"preset '{name}' already exists (use --force to replace it)")
+    model = args.model.strip()
+    if args.context == "1m" and not has_context_suffix(model):
+        model = strip_context_suffix(model) + "[1m]"
+    elif args.context == "no":
+        model = strip_context_suffix(model)
+    else:
+        model = maybe_append_1m(cfg, model)
+    if not looks_like_model_id(model):
+        raise CcmError(f"'{args.model}' does not look like an OpenRouter model id (expected 'provider/model')")
+    label = sanitize_text(args.label or catalog_label(cached_catalog(), model) or pretty_model(model))
+    small = args.small or choose_small_model(cfg, model)
+    subagent = args.subagent or choose_subagent_model(cfg, model)
+    preset = {
+        "name": name,
+        "label": label,
+        "primary": model,
+        "small": small,
+        "subagent": subagent,
+        "description": sanitize_text(args.description or ""),
+    }
+    if args.vision:
+        preset["vision"] = args.vision
+    if name in existing:
+        cfg["presets"] = [preset if p["name"] == name else p for p in cfg["presets"]]
+    else:
+        cfg["presets"].append(preset)
+    save_config(cfg)
+    catalog = cached_catalog()
+    if catalog and lookup_model(catalog, model) is None:
+        warn(f"'{model}' is not in the cached OpenRouter catalog; "
+             f"run `ccm refresh` or double-check the id")
+    if (cfg.get("picker") or {}).get("installed"):
+        try:
+            sync_picker_settings(cfg)
+        except CcmError as exc:
+            warn(f"preset saved, but could not update /model picker settings: {exc}")
+    ok(f"preset '{name}' saved: {model}")
+    info(f"  fast      {small}")
+    info(f"  subagent  {subagent}")
+    info(f"  vision    {describe_vision(preset, cfg)}")
+    info(f"  Activate with: ccm use {name}")
+    return 0
+
+
+def cmd_remove(args) -> int:
+    cfg = load_config()
+    name = args.name
+    if name not in preset_map(cfg):
+        raise CcmError(f"no preset named '{name}' (known: {', '.join(preset_names(cfg))})")
+    cfg["presets"] = [p for p in cfg["presets"] if p["name"] != name]
+    if not cfg["presets"]:
+        raise CcmError("cannot remove the last preset; add another one first")
+    current = cfg.get("current") or {}
+    if current.get("preset") == name:
+        replacement = cfg["presets"][0]["name"]
+        cfg["current"] = {"preset": replacement}
+    save_config(cfg)
+    selection = resolve_current(cfg)
+    write_env_files(cfg, selection)
+    if (cfg.get("picker") or {}).get("installed"):
+        sync_picker_settings(cfg)
+    ok(f"preset '{name}' removed")
+    if current.get("preset") == name:
+        info(f"  active preset is now '{cfg['current']['preset']}'")
+    return 0
+
+
+def cmd_completions(args) -> int:
+    if args.shell == "fish":
+        print(fish_completions_text(), end="")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# install / uninstall
+# ---------------------------------------------------------------------------
+
+def install_binary(force: bool = False) -> Path:
+    source = Path(os.path.realpath(__file__))
+    target = installed_binary_path()
+    if target.exists() and source.samefile(target):
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        try:
+            existing = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            existing = ""
+        if MARKER not in existing:
+            if not force:
+                raise CcmError(
+                    f"{target} already exists and does not look like ccm; "
+                    f"rerun with --force to replace it (a backup is kept)"
+                )
+            backup_once(target)
+    atomic_write(target, source.read_text(encoding="utf-8"), mode=0o755)
+    return target
+
+
+def warn_duplicate_fish_exports() -> None:
+    path = fish_config_path()
+    if not path.exists():
+        return
+    text = read_text(path)
+    outside = FISH_BLOCK_RE.sub("", text, count=1)
+    duplicates = []
+    for line in outside.splitlines():
+        if re.search(r"^\s*set\s+(-\S+\s+)*ANTHROPIC_(MODEL|DEFAULT_\w+_MODEL)\b", line) \
+                or re.search(r"^\s*set\s+(-\S+\s+)*CLAUDE_CODE_SUBAGENT_MODEL\b", line):
+            duplicates.append(line.strip())
+    if duplicates:
+        warn(f"{path} still sets model variables before the ccm block "
+             f"({len(duplicates)} line(s)); the ccm block overrides them at the end.")
+        info("  You can delete those old lines to keep a single source of truth (optional).")
+
+
+def cmd_install(args) -> int:
+    # Validate before writing anything so a refused install leaves no partial state.
+    if not args.no_fish:
+        validate_fish_markers()
+    lines: list[str] = []
+    if not args.no_binary:
+        target = install_binary(force=args.force)
+        lines.append(f"binary     {target}")
+        path_parts = os.environ.get("PATH", "").split(os.pathsep)
+        if str(target.parent) not in path_parts:
+            warn(f"{target.parent} is not on PATH; add it to your fish PATH")
+    cfg = load_config()
+    selection = resolve_current(cfg)
+    if args.refresh:
+        try:
+            models = fetch_models(cfg)
+            save_cache(models)
+            ok(f"model catalog refreshed: {len(models)} models")
+        except CcmError as exc:
+            warn(str(exc))
+    write_env_files(cfg, selection)
+    lines.append(f"env        {env_fish_path()}")
+    lines.append(f"           {env_sh_path()}")
+    if not args.no_fish:
+        if shutil.which("fish") or fish_dir().exists():
+            try:
+                for path in install_fish_integration():
+                    lines.append(f"fish       {path}")
+            except OSError as exc:
+                raise CcmError(f"could not write fish integration ({fish_dir()}): {exc}") from exc
+        else:
+            warn(f"fish not found; skipping fish integration ({fish_dir()} untouched)")
+    if args.with_picker:
+        try:
+            picker_install(cfg)
+        except CcmError as exc:
+            warn(f"could not update the /model picker: {exc}")
+    ok(f"ccm {VERSION} installed")
+    for line in lines:
+        info(f"  {line}")
+    print()
+    print_selection(selection, cfg)
+    print_activation_hint(selection)
+    print()
+    info("Verify anytime with: ccm doctor")
+    if not _shell_is_fish():
+        info(f"Non-fish shell: add `source {env_sh_path()}` to your shell startup file.")
+    warn_duplicate_fish_exports()
+    return 0
+
+
+def cmd_uninstall(args) -> int:
+    removed: list[str] = []
+    if config_path().exists():
+        try:
+            cfg = load_config()
+            picker_remove(cfg, quiet=True)
+        except CcmError as exc:
+            warn(f"skipped /model picker restore: {exc}")
+    if not args.no_fish:
+        try:
+            if remove_fish_block():
+                removed.append(f"managed block from {fish_config_path()}")
+        except CcmError as exc:
+            warn(str(exc))
+        if remove_if_ours(fish_function_path()):
+            removed.append(str(fish_function_path()))
+        if remove_if_ours(fish_completions_path()):
+            removed.append(str(fish_completions_path()))
+    if not args.keep_binary:
+        target = installed_binary_path()
+        if target.exists():
+            try:
+                content = target.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                content = ""
+            if MARKER in content:
+                target.unlink()
+                removed.append(str(target))
+                backup = target.with_name(target.name + ".ccm-backup")
+                if backup.exists():
+                    os.replace(backup, target)
+                    removed.append(f"restored previous {target.name} from {backup.name}")
+            else:
+                warn(f"left {target} in place (not an installed ccm binary)")
+    if args.purge:
+        directory = config_dir()
+        if directory.exists():
+            resolved = directory.resolve()
+            if resolved.name != "ccm" or resolved in (Path("/"), home_dir().resolve()):
+                raise CcmError(f"refusing to delete unexpected path: {resolved}")
+            shutil.rmtree(resolved)
+            removed.append(f"{resolved} (config + presets + cache)")
+    if removed:
+        ok("ccm uninstalled:")
+        for item in removed:
+            info(f"  removed {item}")
+    else:
+        warn("nothing to uninstall (or ccm was already removed)")
+    if args.purge:
+        info("  Backups (*.ccm-backup) were kept.")
+    info("Your OpenRouter API key, base URL and any old model exports were left untouched.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+
+def cmd_doctor(args) -> int:
+    checks: list[tuple[str, str, str]] = []
+
+    def add(status: str, title: str, detail: str = "") -> None:
+        checks.append((status, title, detail))
+
+    cfg: dict | None = None
+    try:
+        cfg = load_config()
+        add("PASS", "ccm config", str(config_path()))
+    except CcmError as exc:
+        add("FAIL", "ccm config", str(exc))
+
+    expected: dict[str, str] = {}
+    if cfg:
+        try:
+            selection = resolve_current(cfg)
+            expected = env_vars_for(selection)
+            add("PASS", "active preset", f"{selection.get('label')} — {selection['primary']}")
+        except CcmError as exc:
+            add("FAIL", "active preset", str(exc))
+
+    claude_bin = (cfg["settings"].get("claude_bin") if cfg else "claude") or "claude"
+    claude_path = shutil.which(claude_bin)
+    if claude_path:
+        version = ""
+        try:
+            proc = subprocess.run([claude_path, "--version"], capture_output=True, text=True, timeout=20)
+            version = (proc.stdout or proc.stderr).strip().splitlines()[0] if (proc.stdout or proc.stderr) else ""
+        except (OSError, subprocess.SubprocessError):
+            pass
+        add("PASS", "claude CLI", f"{claude_path}" + (f" ({version})" if version else ""))
+    else:
+        add("FAIL", "claude CLI", f"'{claude_bin}' not found on PATH; `ccm run` cannot launch Claude Code")
+
+    base_url = os.environ.get("ANTHROPIC_BASE_URL")
+    if base_url:
+        add("PASS", "ANTHROPIC_BASE_URL", base_url)
+        if cfg and "openrouter.ai" not in base_url:
+            add("WARN", "OpenRouter base URL",
+                "ANTHROPIC_BASE_URL does not point at openrouter.ai; model ids may not resolve")
+    else:
+        add("WARN", "ANTHROPIC_BASE_URL",
+            "not set in this shell; start Claude Code from a shell that loads your fish config")
+
+    token = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
+    if token:
+        add("PASS", "API credential", "ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY is present")
+    else:
+        add("WARN", "API credential",
+            "no ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY in this shell (ccm never stores it)")
+
+    if expected:
+        actual_model = os.environ.get("ANTHROPIC_MODEL")
+        if actual_model == expected.get("ANTHROPIC_MODEL"):
+            add("PASS", "shell model env", f"ANTHROPIC_MODEL={actual_model}")
+        elif actual_model:
+            add("WARN", "shell model env",
+                f"ANTHROPIC_MODEL={actual_model} (configured: {expected.get('ANTHROPIC_MODEL')})")
+        else:
+            add("WARN", "shell model env",
+                "ANTHROPIC_MODEL is not set in this shell; open a new terminal or source env.fish")
+
+    if env_fish_path().exists():
+        add("PASS", "env files", f"{env_fish_path()} (+ env.sh)")
+        fish = shutil.which("fish")
+        if fish:
+            try:
+                proc = subprocess.run([fish, "-n", str(env_fish_path())],
+                                      capture_output=True, text=True, timeout=20)
+                if proc.returncode == 0:
+                    add("PASS", "fish syntax", "env.fish parses")
+                else:
+                    add("FAIL", "fish syntax", proc.stderr.strip()[:300])
+            except (OSError, subprocess.SubprocessError) as exc:
+                add("WARN", "fish syntax", f"could not check: {exc}")
+    else:
+        add("WARN", "env files", f"{env_fish_path()} missing; run `ccm install`")
+
+    if shutil.which("fish"):
+        if fish_block_present():
+            add("PASS", "fish integration", f"managed block in {fish_config_path()}")
+        else:
+            add("WARN", "fish integration", f"no ccm block in {fish_config_path()}; run `ccm install`")
+        if fish_function_path().exists():
+            add("PASS", "fish wrapper", str(fish_function_path()))
+        else:
+            add("WARN", "fish wrapper", "not installed; `ccm use` will not refresh this shell automatically")
+    else:
+        add("WARN", "fish", "fish is not installed; POSIX users can source env.sh")
+
+    if shutil.which("ccm"):
+        add("PASS", "ccm on PATH", shutil.which("ccm"))
+    else:
+        add("WARN", "ccm on PATH", "ccm is not on PATH; run `ccm install` or add ~/.local/bin")
+
+    cache = load_cache()
+    if cache:
+        add("PASS", "model catalog", f"{len(cache['models'])} models, fetched {describe_age(cache['fetched_at'])}")
+        if expected:
+            missing_models = []
+            for key in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"):
+                model = expected.get(key)
+                if model and lookup_model(cache["models"], model) is None:
+                    missing_models.append(model)
+            if missing_models:
+                add("WARN", "catalog check",
+                    "not found in OpenRouter catalog: " + ", ".join(sorted(set(missing_models))))
+            else:
+                add("PASS", "catalog check", "configured models exist in the OpenRouter catalog")
+    else:
+        add("WARN", "model catalog", "no cache yet; run `ccm refresh`")
+
+    hook = vision_config_path()
+    if hook.exists():
+        detected = detected_vision_model()
+        add("PASS", "vision hook", str(hook) + (f" (model: {detected})" if detected else ""))
+    else:
+        add("WARN", "vision hook", f"{hook} not found; images rely on native model vision")
+    if cfg:
+        try:
+            vision_selection = resolve_current(cfg)
+            add("PASS", "vision routing", describe_vision(vision_selection, cfg))
+            override_model = sanitize_text(cfg["settings"].get("vision_model") or "")
+            if override_model and cache and lookup_model(cache["models"], override_model) is None:
+                add("WARN", "vision model", f"'{override_model}' not found in the OpenRouter catalog")
+        except CcmError as exc:
+            add("WARN", "vision routing", str(exc))
+    if cache and cache["models"] and not any("input_modalities" in item for item in cache["models"][:50]):
+        add("WARN", "vision capability data", "catalog cache predates image-capability tracking; run `ccm refresh`")
+
+    if args.online:
+        if cfg is None:
+            add("FAIL", "network", "not tested: ccm config is unavailable")
+        else:
+            try:
+                models = fetch_models(cfg)
+                save_cache(models)
+                add("PASS", "network", f"OpenRouter reachable, {len(models)} models")
+            except CcmError as exc:
+                add("FAIL", "network", str(exc))
+
+    for status, title, detail in checks:
+        line = f"[{status}] {title}"
+        if detail:
+            line += f" — {detail}"
+        if status == "PASS":
+            print(_paint("32", line))
+        elif status == "WARN":
+            print(_paint("33", line))
+        else:
+            print(_paint("31", line))
+    failures = sum(1 for status, _, _ in checks if status == "FAIL")
+    warnings = sum(1 for status, _, _ in checks if status == "WARN")
+    print()
+    if failures:
+        fail(f"{failures} check(s) failed, {warnings} warning(s)")
+        return 1
+    msg = "all checks passed" if not warnings else f"no failures, {warnings} warning(s)"
+    ok(msg)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# run (launch claude with a model)
+# ---------------------------------------------------------------------------
+
+RUN_HELP = """\
+usage: ccm run [preset|model] [--] [claude args...]
+
+Launch Claude Code on a preset or model for this session only.
+The first positional argument is used as the model only when it matches a
+preset name or a provider/model id; anything else is passed to claude.
+
+  --dry-run     print the model, env and command without launching
+  --print-env   print the environment exports without launching
+  -h, --help    show this help
+
+examples:
+  ccm run                       launch on the current default preset
+  ccm run flash --resume        launch on 'flash', resuming the last session
+  ccm run pro -p "hello"        pass flags/prompts through to claude
+  ccm run "fix src/main.py"     prompt on the current default preset
+"""
+
+
+def cmd_run(raw_args: list[str]) -> int:
+    if raw_args and raw_args[0] in ("-h", "--help"):
+        print(RUN_HELP, end="")
+        return 0
+    cfg = load_config()
+    target: str | None = None
+    rest: list[str] = []
+    dry_run = False
+    print_env_only = False
+    parsing_target = True
+    index = 0
+    presets = preset_map(cfg)
+    while index < len(raw_args):
+        arg = raw_args[index]
+        if parsing_target and arg in ("--dry-run",):
+            dry_run = True
+            index += 1
+            continue
+        if parsing_target and arg in ("--print-env",):
+            print_env_only = True
+            index += 1
+            continue
+        if parsing_target and arg == "--":
+            rest = raw_args[index + 1:]
+            break
+        if parsing_target and not arg.startswith("-") and target is None:
+            if arg in presets or looks_like_model_id(arg):
+                target = arg
+                index += 1
+                continue
+        rest = raw_args[index:]
+        break
+    selection = selection_for_target(cfg, target)
+    mapping = {**env_vars_for(selection), **vision_env_for(cfg, selection)}
+    env = os.environ.copy()
+    env.update(mapping)
+    if print_env_only:
+        print(render_env_sh(cfg, selection), end="")
+        return 0
+    claude_bin = os.environ.get("CCM_CLAUDE_BIN") or cfg["settings"].get("claude_bin") or "claude"
+    resolved = shutil.which(claude_bin) if os.sep not in claude_bin else claude_bin
+    if dry_run:
+        command = [resolved or claude_bin] + rest
+        info(f"model: {selection['primary']}")
+        info("vision: " + describe_vision(selection, cfg))
+        info("env: " + " ".join(f"{k}={v}" for k, v in mapping.items()))
+        info("command: " + " ".join(sh_quote(part) for part in command))
+        return 0
+    if not resolved:
+        raise CcmError(f"Claude Code binary '{claude_bin}' not found on PATH")
+    command = [resolved] + rest
+    print(_paint("2", f"ccm: launching Claude Code with {selection.get('label')} ({selection['primary']})"),
+          file=sys.stderr)
+    try:
+        os.execvpe(resolved, command, env)
+    except OSError as exc:
+        raise CcmError(f"could not launch '{resolved}': {exc}") from exc
+    return 0  # unreachable
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+EXAMPLES = """\
+examples:
+  ccm                           pick a model interactively and make it the default
+  ccm use flash                 switch the default model to the 'flash' preset
+  ccm use deepseek/deepseek-v4.1-flash   use any OpenRouter model id (1M context auto-detected)
+  ccm run pro --resume          launch Claude Code on a preset for one session only
+  ccm run "fix src/main.py"     launch on the current default with a prompt
+  ccm run                       launch Claude Code with the current default model
+  ccm search flash              search the cached OpenRouter catalog
+  ccm search -i coder           search and pick interactively
+  ccm add cheap deepseek/deepseek-v4-flash-0731 --label "DeepSeek V4 Flash"
+  ccm list                      list presets
+  ccm current                   show active model + whether this shell has it loaded
+  ccm install                   install the fish hook + ~/.local/bin/ccm (idempotent)
+  ccm picker on                 add labelled rows to Claude Code's in-session /model picker
+  ccm vision                    show automatic image/vision routing
+  ccm vision auto off           stop ccm from managing VISION_* variables
+  ccm vision model google/gemini-3.8-flash   override the image-description model
+  ccm doctor                    run health checks
+"""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ccm",
+        description="Claude Code model switcher for OpenRouter.",
+        epilog=EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--version", action="version", version=f"ccm {VERSION}")
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    p_list = sub.add_parser("list", help="list model presets")
+    p_list.add_argument("--json", action="store_true")
+    p_list.add_argument("--oneline", action="store_true")
+    p_list.set_defaults(func=cmd_list)
+
+    p_current = sub.add_parser("current", help="show the active model and environment status")
+    p_current.add_argument("--json", action="store_true")
+    p_current.set_defaults(func=cmd_current)
+
+    p_use = sub.add_parser("use", help="set the default model (preset name or OpenRouter model id)")
+    p_use.add_argument("target")
+    p_use.add_argument("--small", metavar="MODEL", help="model for haiku/background tasks")
+    p_use.add_argument("--subagent", metavar="MODEL", help="model for subagents")
+    p_use.add_argument("--label", metavar="TEXT", help="display name for the model")
+    p_use.add_argument("--1m", dest="context", action="store_const", const="1m",
+                       help="force the [1m] context suffix")
+    p_use.add_argument("--no-1m", dest="context", action="store_const", const="no",
+                       help="strip the [1m] context suffix")
+    p_use.add_argument("--vision", choices=list(VISION_MODES),
+                       help="vision handling for this raw model id (auto/native/describe)")
+    p_use.set_defaults(func=cmd_use, context=None)
+
+    p_pick = sub.add_parser("pick", help="interactively pick a preset or OpenRouter model")
+    p_pick.set_defaults(func=cmd_pick)
+
+    p_search = sub.add_parser("search", help="search the OpenRouter model catalog")
+    p_search.add_argument("query")
+    p_search.add_argument("--limit", type=int, default=25)
+    p_search.add_argument("-i", "--interactive", action="store_true")
+    p_search.add_argument("--all", action="store_true", help="include non-tool/image models")
+    p_search.add_argument("--json", action="store_true")
+    p_search.set_defaults(func=cmd_search)
+
+    p_add = sub.add_parser("add", help="save a model id as a named preset")
+    p_add.add_argument("name")
+    p_add.add_argument("model")
+    p_add.add_argument("--label", metavar="TEXT")
+    p_add.add_argument("--small", metavar="MODEL")
+    p_add.add_argument("--subagent", metavar="MODEL")
+    p_add.add_argument("--description", metavar="TEXT")
+    p_add.add_argument("--1m", dest="context", action="store_const", const="1m")
+    p_add.add_argument("--no-1m", dest="context", action="store_const", const="no")
+    p_add.add_argument("--force", action="store_true", help="replace an existing preset")
+    p_add.add_argument("--vision", choices=list(VISION_MODES),
+                       help="vision handling: auto (detect), native, or describe (Gemini hook)")
+    p_add.set_defaults(func=cmd_add, context=None)
+
+    p_remove = sub.add_parser("remove", help="delete a preset")
+    p_remove.add_argument("name")
+    p_remove.set_defaults(func=cmd_remove)
+
+    p_refresh = sub.add_parser("refresh", help="refresh the OpenRouter model catalog cache")
+    p_refresh.add_argument("--json", action="store_true")
+    p_refresh.set_defaults(func=cmd_refresh)
+
+    p_env = sub.add_parser("env", help="print shell exports for a preset/model")
+    p_env.add_argument("target", nargs="?")
+    p_env.add_argument("--shell", choices=["auto", "fish", "sh"], default="auto")
+    p_env.set_defaults(func=cmd_env)
+
+    p_install = sub.add_parser("install", help="install ccm + fish integration (idempotent)")
+    p_install.add_argument("--with-picker", action="store_true",
+                           help="also add ccm presets to Claude Code's in-session /model picker")
+    p_install.add_argument("--refresh", action="store_true", help="refresh the model catalog during install")
+    p_install.add_argument("--no-binary", action="store_true", help="do not copy ccm into ~/.local/bin")
+    p_install.add_argument("--no-fish", action="store_true", help="do not touch fish config")
+    p_install.add_argument("--force", action="store_true", help="replace an unrelated existing ~/.local/bin/ccm")
+    p_install.set_defaults(func=cmd_install)
+
+    p_uninstall = sub.add_parser("uninstall", help="remove ccm's shell integration")
+    p_uninstall.add_argument("--purge", action="store_true", help="also delete ~/.config/ccm (presets/cache)")
+    p_uninstall.add_argument("--keep-binary", action="store_true", help="leave ~/.local/bin/ccm in place")
+    p_uninstall.add_argument("--no-fish", action="store_true", help="do not touch fish config")
+    p_uninstall.set_defaults(func=cmd_uninstall)
+
+    p_picker = sub.add_parser("picker", help="manage in-session /model picker rows")
+    p_picker.add_argument("action", choices=["on", "off", "status"])
+    p_picker.set_defaults(func=_cmd_picker)
+
+    p_vision = sub.add_parser("vision", help="automatic image/vision routing (Gemini hook)")
+    p_vision.add_argument("action", nargs="?", default="status",
+                          choices=["status", "model", "auto", "on", "off"])
+    p_vision.add_argument("value", nargs="?")
+    p_vision.set_defaults(func=cmd_vision)
+
+    p_doctor = sub.add_parser("doctor", help="run health checks")
+    p_doctor.add_argument("--online", action="store_true", help="also test the OpenRouter catalog request")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    p_completions = sub.add_parser("completions", help="print shell completions")
+    p_completions.add_argument("shell", choices=["fish"], default="fish", nargs="?")
+    p_completions.set_defaults(func=cmd_completions)
+
+    p_version = sub.add_parser("version", help="print the ccm version")
+    p_version.set_defaults(func=lambda _args: (print(f"ccm {VERSION}") or 0))
+
+    p_help = sub.add_parser("help", help="show this help")
+    p_help.set_defaults(func=lambda _args: (parser.print_help() or 0))
+
+    p_presets = sub.add_parser("__presets")
+    p_presets.set_defaults(func=_cmd_presets)
+
+    return parser
+
+
+def cmd_vision(args) -> int:
+    cfg = load_config()
+    action = args.action
+    value = args.value
+    if action in ("on", "off"):
+        action, value = "auto", action
+    if action == "status":
+        return _vision_status(cfg)
+    if action == "auto":
+        if value not in ("on", "off"):
+            raise CcmError("usage: ccm vision auto on|off")
+        cfg["settings"]["vision_auto"] = value == "on"
+        save_config(cfg)
+        selection = resolve_current(cfg)
+        write_env_files(cfg, selection)
+        if value == "on":
+            ok("automatic vision routing enabled")
+            info(f"  current preset: {describe_vision(selection, cfg)}")
+        else:
+            ok("automatic vision routing disabled")
+            info("  ccm no longer sets VISION_MODEL/VISION_DISABLE; the hook uses its own config")
+        return 0
+    if action == "model":
+        if not value:
+            raise CcmError("usage: ccm vision model <provider/model>")
+        model = value.strip()
+        if not looks_like_model_id(model):
+            raise CcmError(f"'{model}' does not look like an OpenRouter model id")
+        cfg["settings"]["vision_model"] = model
+        save_config(cfg)
+        selection = resolve_current(cfg)
+        write_env_files(cfg, selection)
+        cache = cached_catalog()
+        if cache and lookup_model(cache, model) is None:
+            warn(f"'{model}' is not in the cached OpenRouter catalog; check the id")
+        ok(f"vision model set: {model}")
+        info(f"  current preset: {describe_vision(selection, cfg)}")
+        return 0
+    raise CcmError(f"unknown vision action '{action}'")
+
+
+def _vision_status(cfg: dict) -> int:
+    selection = resolve_current(cfg)
+    status = vision_status(cfg, selection)
+
+    def cap(value) -> str:
+        return "yes" if value is True else ("no" if value is False else "unknown")
+
+    info("Vision handling")
+    info(f"  managed by ccm  {'yes' if status['managed'] else 'no (automatic routing off)'}")
+    info(f"  vision model    {status['vision_model'] or '(from the vision hook config)'}")
+    info(f"  hook config     {status['hook_config'] or 'not found (~/.deepseek-vl/config.json)'}")
+    info(f"  main model      {selection['primary']}  (accepts images: {cap(status['primary_supports_images'])})")
+    subagent = selection.get("subagent")
+    if subagent:
+        info(f"  subagent model  {subagent}  (accepts images: {cap(status['subagent_supports_images'])})")
+    info(f"  active preset   {describe_vision(selection, cfg)}")
+    if status["env"]:
+        info("  exported env    " + " ".join(f"{k}={v}" for k, v in status["env"].items()))
+    else:
+        info("  exported env    (none)")
+    if status["managed"] and status["primary_supports_images"] is None:
+        info("  note: capability data missing for this model; run `ccm refresh`")
+    return 0
+
+
+def _cmd_picker(args) -> int:
+    cfg = load_config()
+    if args.action == "on":
+        picker_install(cfg)
+        return 0
+    if args.action == "off":
+        picker_remove(cfg)
+        return 0
+    return picker_status(cfg)
+
+
+def _cmd_presets(_args) -> int:
+    try:
+        cfg = load_config(auto_create=False)
+    except CcmError:
+        return 0
+    for name in preset_names(cfg):
+        print(name)
+    return 0
+
+
+def _suggest(name: str, cfg: dict | None) -> str:
+    choices = list(COMMANDS) + (preset_names(cfg) if cfg else [])
+    matches = difflib.get_close_matches(name, choices, n=3, cutoff=0.5)
+    return ("\n  Did you mean: " + ", ".join(matches)) if matches else ""
+
+
+def _dispatch(argv: list[str]) -> int:
+    if not argv:
+        return cmd_pick(argparse.Namespace())
+    if argv[0] in ("-h", "--help"):
+        build_parser().print_help()
+        return 0
+    if argv[0] == "run":
+        return cmd_run(argv[1:])
+    if argv[0] not in COMMANDS and not argv[0].startswith("-"):
+        try:
+            cfg = load_config()
+        except CcmError:
+            cfg = None
+        if cfg and (argv[0] in preset_map(cfg) or looks_like_model_id(argv[0])):
+            return cmd_use(argparse.Namespace(
+                target=argv[0], small=None, subagent=None, label=None,
+                context=None, vision=None,
+            ))
+        raise CcmError(f"unknown command or preset: '{argv[0]}'" + _suggest(argv[0], cfg))
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "command", None) is None:
+        return cmd_pick(args)
+    return args.func(args)
+
+
+_NO_LOCK_COMMANDS = {
+    "run", "version", "help", "completions", "__presets",
+    "-h", "--help", "--version",
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        if argv and argv[0] in _NO_LOCK_COMMANDS:
+            return _dispatch(argv)
+        with config_lock():
+            return _dispatch(argv)
+    except CcmError as exc:
+        print(f"ccm: error: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print()
+        return 130
+    except BrokenPipeError:
+        return 0
+    except OSError as exc:
+        print(f"ccm: filesystem error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - keep the CLI friendly
+        if os.environ.get("CCM_DEBUG"):
+            raise
+        print(f"ccm: unexpected error: {exc}", file=sys.stderr)
+        print("  Set CCM_DEBUG=1 and rerun to see the traceback.", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

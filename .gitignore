@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local scratch / test artifacts
+.scratch/
+.vision-home/
+tests/verification/
+
+# Editor/OS noise
+.DS_Store
+*.swp
